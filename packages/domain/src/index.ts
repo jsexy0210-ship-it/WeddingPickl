@@ -31,6 +31,8 @@ export * from './wedding';
 export * from './expense';
 export * from './membership';
 export * from './notification';
+export * from './notification-event';
+export * from './alimtalk-template';
 export * from './rebuttal';
 export * from './my-reports';
 export * from './disclosure';

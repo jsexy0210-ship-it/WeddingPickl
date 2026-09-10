@@ -1,0 +1,49 @@
+{
+  "$comment": "카카오 알림톡 템플릿 정본. 문구는 여기에만 적는다(CLAUDE.md — 값은 spec에서만). 카카오에 사전 승인된 문안과 한 글자라도 다르면 발송이 반려되므로, 승인본이 바뀌면 이 파일을 먼저 고친다.",
+  "$approval": "approved는 카카오 템플릿 심사를 통과한 뒤에만 true로 바꾼다. false인 동안 그 템플릿은 알림톡을 건너뛰고 기존 푸시·알림함 경로만 탄다.",
+  "$buttonNote": "button은 카카오에 버튼으로 등록하는 이름이다. body 끝의 대괄호 줄은 사용자가 준 원문 그대로 두었다 — 등록 시 카카오 콘솔이 버튼을 별도 필드로 받으면 그때 이 줄을 뺀다. 지금 지우면 원문이 사라지고 무엇이 원본이었는지 알 수 없게 된다. WP_VERIFY_REJECTED는 원문 본문 끝이 [확인하기]지만 버튼 이름은 「다시 확인하기」다(2026-09-09 결정) — 재심사를 요청하는 행동이라 그 말이 정확하다.",
+  "templates": {
+    "WP_COUPLE_INVITE": {
+      "situation": "배우자 초대",
+      "variables": ["senderName"],
+      "button": "초대 확인하기",
+      "approved": false,
+      "body": "[웨딩픽] 함께 준비할 초대가 도착했어요\n\n#{senderName}님이 웨딩픽에서\n함께 결혼 준비를 하도록 초대했어요.\n\n초대를 확인하면 일정과 Pick을\n함께 관리할 수 있어요.\n\n[초대 확인하기]"
+    },
+    "WP_SCHEDULE_D1": {
+      "situation": "중요 일정 D-1",
+      "variables": ["scheduleDate", "scheduleTitle"],
+      "button": "일정 확인하기",
+      "approved": false,
+      "body": "[웨딩픽] 내일 예정된 일정이 있어요\n\n#{scheduleDate}\n#{scheduleTitle}\n\n등록한 일정이 내일이에요.\n시간과 장소를 다시 확인해 주세요.\n\n[일정 확인하기]"
+    },
+    "WP_VERIFY_APPROVED": {
+      "situation": "Pick 인증 승인",
+      "variables": ["businessName"],
+      "button": "인증 확인하기",
+      "approved": false,
+      "body": "[웨딩픽] Pick 인증 확인이 완료됐어요\n\n#{businessName}에 등록한\nPick 인증 확인이 완료됐어요.\n\n확인된 내용을 웨딩픽에서 볼 수 있어요.\n\n[인증 확인하기]"
+    },
+    "WP_VERIFY_REJECTED": {
+      "situation": "Pick 인증 반려",
+      "variables": ["businessName", "reason"],
+      "button": "다시 확인하기",
+      "approved": false,
+      "body": "[웨딩픽] Pick 인증을 다시 확인해 주세요\n\n#{businessName}에 등록한\nPick 인증에서 확인이 필요한 부분이 있어요.\n\n사유: #{reason}\n\n내용을 확인한 뒤 다시 등록해 주세요.\n\n[확인하기]"
+    },
+    "WP_REWARD_WIN": {
+      "situation": "지원금 당첨",
+      "variables": ["eventMonth", "deadline"],
+      "button": "당첨 확인하기",
+      "approved": false,
+      "body": "[웨딩픽] 웨딩지원금 당첨 안내\n\n#{eventMonth} 웨딩지원금에 당첨됐어요.\n\n지급을 위해 필요한 내용을\n#{deadline}까지 확인해 주세요.\n\n[당첨 확인하기]"
+    },
+    "WP_ACCOUNT_NOTICE": {
+      "situation": "중요 계정 상태",
+      "variables": ["accountAction"],
+      "button": "내용 확인하기",
+      "approved": false,
+      "body": "[웨딩픽] 계정 변경 안내\n\n#{accountAction} 처리가 완료됐어요.\n\n본인이 요청하지 않은 변경이라면\n웨딩픽에서 계정 상태를 확인해 주세요.\n\n[내용 확인하기]"
+    }
+  }
+}

@@ -1,15 +1,20 @@
 import {
   NOTIFICATION_CAP_EXEMPT_KINDS,
+  NOTIFICATION_EVENT_POLICY,
   NOTIFICATION_TIMEZONE,
   NOTIFICATION_TOPICS_ALWAYS,
   isCappedNotification,
   reachedDailyCap,
+  type NotificationEvent,
   type NotificationKind,
   type NotificationTopic,
+  type NotificationVariant,
 } from '@weddingpick/domain';
 import type { Pool } from 'pg';
 
 import type { Push, PushMessage } from '../push/port';
+import { sendAlimtalk, type AlimtalkRecord } from './alimtalk/deliver';
+import type { Alimtalk } from './alimtalk/port';
 
 /**
  * 사용자에게 알림을 보낸다. 최종통합정책 v2.0 36번 · 핸드오프 v3.22 SPEC 13.12.
@@ -47,6 +52,14 @@ export type Deliverable = {
    * 알림은 시끄러운 사람이 있다.
    */
   priceChange?: boolean;
+  /**
+   * 서비스 필수 알림인가. 하루 한도를 세지 않는다.
+   *
+   * 배우자 초대 · 인증 결과 · 계정 변경 · 당첨 안내처럼 **사용자가 반드시 확인해야
+   * 하는 것**만 여기 해당한다(notification-event.ts의 여섯 이벤트). 당첨 안내가
+   * «오늘은 두 건 다 썼어요»로 사라지면 그 사람은 지급받을 방법을 모른다.
+   */
+  essential?: boolean;
 };
 
 export type DeliveryResult = {
@@ -100,7 +113,7 @@ export async function deliver(
      * 막힘»이 아니다. 순서를 바꾸면 한도가 찬 날 워커가 돌 때마다 이미 보낸
      * 알림이 capped로 세여 숫자가 거짓이 된다.
      */
-    if (isCappedNotification({ kind: item.kind, topic })) {
+    if (!item.essential && isCappedNotification({ kind: item.kind, topic })) {
       const alreadySent = item.dedupeKey
         ? await deps.pool.query(
             `SELECT 1 FROM structured.notifications WHERE user_id = $1 AND dedupe_key = $2`,
@@ -184,4 +197,79 @@ export async function deliver(
   }
 
   return result;
+}
+
+/**
+ * 이벤트 하나를 알림함 · 푸시 · 알림톡으로 보낸다. 사용자 오더(2026-09-09).
+ *
+ * **부르는 쪽은 이벤트 이름만 안다.** 템플릿 번호도, 카카오 API도, 어느 채널로
+ * 나가는지도 모른다 — 채널 정책이 바뀔 때 기능 코드를 열지 않기 위해서다.
+ *
+ * 알림톡이 안 나가도 알림함과 푸시는 나간다. 곁가지가 본줄기를 끊지 않는다.
+ */
+export type NotificationRequest = {
+  event: NotificationEvent;
+  /** 결과에 따라 문안이 갈리는 이벤트(인증 결과)에만 필요하다. */
+  variant?: NotificationVariant;
+  userId: string;
+  /**
+   * 알림함에 남길 문구.
+   *
+   * 화면 문구라 부르는 쪽이 `spec/strings.ko.json`에서 가져와 넣는다 — 알림톡
+   * 문안(spec/alimtalk.templates.json)과 정본이 다르다.
+   */
+  inbox: { title: string; body: string; targetId?: string | null };
+  /** 알림톡 템플릿 변수. 승인 전이거나 보낼 수 없으면 쓰이지 않는다. */
+  variables?: Readonly<Record<string, string>>;
+  /** 무엇에 대한 알림인지 나타내는 열쇠. 알림함과 알림톡이 같은 값을 쓴다. */
+  dedupeKey?: string | null;
+};
+
+export async function sendNotification(
+  deps: { pool: Pool; push: Push; alimtalk?: Alimtalk | null; env?: NodeJS.ProcessEnv },
+  request: NotificationRequest
+): Promise<{ delivery: DeliveryResult; alimtalk: AlimtalkRecord }> {
+  const policy = NOTIFICATION_EVENT_POLICY[request.event];
+
+  const delivery = await deliver(deps, [
+    {
+      userId: request.userId,
+      kind: policy.kind,
+      topic: policy.topic,
+      essential: policy.essential,
+      title: request.inbox.title,
+      body: request.inbox.body,
+      targetId: request.inbox.targetId ?? null,
+      dedupeKey: request.dedupeKey ?? null,
+    },
+  ]);
+
+  /*
+   * 알림함에 새로 남지 않았으면 알림톡도 보내지 않는다.
+   *
+   * 이미 보낸 알림이라는 뜻이다. 막는 곳을 한 군데로 두면 «알림함에는 없는데
+   * 알림톡은 두 번 온» 상태가 생기지 않는다.
+   */
+  if (delivery.stored === 0) {
+    return { delivery, alimtalk: { status: 'duplicate' } };
+  }
+
+  try {
+    const alimtalk = await sendAlimtalk(deps, {
+      event: request.event,
+      variant: request.variant,
+      userId: request.userId,
+      variables: request.variables ?? {},
+      dedupeKey: request.dedupeKey ?? null,
+    });
+
+    return { delivery, alimtalk };
+  } catch {
+    /*
+     * 알림톡이 터져도 부르는 쪽을 막지 않는다. 알림함에는 이미 남았고, 사용자는
+     * 앱에서 결과를 볼 수 있다. 예외 내용을 여기서 찍지 않는 이유는 수신번호가
+     * 섞여 들어올 수 있어서다.
+     */
+    return { delivery, alimtalk: { status: 'failed', reason: 'error' } };
+  }
 }
