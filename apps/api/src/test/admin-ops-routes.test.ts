@@ -545,8 +545,9 @@ describeWithDb('관리자 운영·시스템 라우트', () => {
     });
 
     /**
-     * **이 판이 광고를 켜지 않는다.** 대표 오더 대기 상태이고(`CLAUDE.md` 「진행 상태」),
-     * 승인 단추 하나가 그 오더를 대신하지 않는다.
+     * **승인은 전환이 아니다.** 켜는 길이 생긴 뒤에도(2026-09-11 대표 지시) 이것은
+     * 그대로다 — 승인 단추 하나로 광고가 나가면 「열기로 정했다」와 「지금 나간다」가
+     * 한 번의 실수로 붙는다.
      */
     it('승인해도 실운영은 꺼진 채다', async () => {
       const operator = await operatorHeaders();
@@ -565,9 +566,80 @@ describeWithDb('관리자 운영·시스템 라우트', () => {
       const gate = (await get('/v1/admin/ads-gate', operator.headers)).json() as {
         steps: { id: string; status: string }[];
         readyForProduction: boolean;
+        activated: boolean;
+        canActivate: boolean;
       };
-      expect(gate.steps.find((s) => s.id === 'production')?.status).toBe('blocked');
+      /* 승인 뒤에는 「켤 수 있음」이다. 켜진 것이 아니다. */
+      expect(gate.steps.find((s) => s.id === 'production')?.status).toBe('in_progress');
+      expect(gate.activated).toBe(false);
+      expect(gate.canActivate).toBe(true);
       expect(gate.readyForProduction).toBe(false);
+    });
+
+    /**
+     * 두 겹으로 막혀 있다 — 라우트가 먼저 보고, 그 줄이 없어도 스키마의
+     * `activation_follows_approval`이 막는다.
+     *
+     * **그래서 상태 코드만 보면 라우트 가드를 확인하지 못한다.** 가드를 빼고
+     * 돌려 보니 여전히 400이었다(2026-09-11 실측). 라우트가 하는 일은 막는 것이
+     * 아니라 **왜 막혔는지 사람에게 말해 주는 것**이라, 그 말을 확인한다 —
+     * 제약이 던지는 오류는 이유를 알려주지 않는다.
+     */
+    it('승인 전에는 켤 수 없고, 왜 막혔는지 말해 준다', async () => {
+      const operator = await operatorHeaders();
+
+      const response = await post('/v1/admin/ads-gate/activate', operator.headers);
+      expect(response.statusCode).toBe(400);
+      expect(response.json<{ error: { message: string } }>().error.message).toContain('먼저 승인');
+
+      const { rows } = await test.pool.query<{ activated: boolean }>(
+        'SELECT activated FROM ads.production_gate WHERE id = true'
+      );
+      expect(rows[0]?.activated).toBe(false);
+    });
+
+    /**
+     * 2026-09-11 대표 지시 — 「광고도 진행해. 단, 관리자에서 내가 컨트롤할 수 있어야
+     * 한다」. **켜는 것과 끄는 것이 둘 다 있어야 컨트롤이다.**
+     */
+    it('승인 뒤에는 켜고 다시 끌 수 있다', async () => {
+      const operator = await operatorHeaders();
+      await bothReports();
+      await post('/v1/admin/ads-gate/approve', operator.headers);
+
+      const on = await post('/v1/admin/ads-gate/activate', operator.headers);
+      expect(on.statusCode).toBe(200);
+      expect(on.json()).toMatchObject({ activated: true });
+
+      const afterOn = (await get('/v1/admin/ads-gate', operator.headers)).json() as {
+        activated: boolean;
+        canActivate: boolean;
+        steps: { id: string; status: string }[];
+      };
+      expect(afterOn.activated).toBe(true);
+      expect(afterOn.canActivate).toBe(false);
+      expect(afterOn.steps.find((s) => s.id === 'production')?.status).toBe('done');
+
+      const off = await post('/v1/admin/ads-gate/deactivate', operator.headers);
+      expect(off.statusCode).toBe(200);
+      expect(off.json()).toMatchObject({ activated: false });
+
+      /* 끄는 것과 승인을 무르는 것은 다른 일이다 — 승인 기록은 남는다. */
+      const { rows } = await test.pool.query<{ activated: boolean; approved_at: Date | null }>(
+        'SELECT activated, approved_at FROM ads.production_gate WHERE id = true'
+      );
+      expect(rows[0]?.activated).toBe(false);
+      expect(rows[0]?.approved_at).not.toBeNull();
+    });
+
+    it('이미 켜진 것을 또 켜지 않는다', async () => {
+      const operator = await operatorHeaders();
+      await bothReports();
+      await post('/v1/admin/ads-gate/approve', operator.headers);
+      await post('/v1/admin/ads-gate/activate', operator.headers);
+
+      const again = await post('/v1/admin/ads-gate/activate', operator.headers);
+      expect(again.statusCode).toBe(400);
     });
 
     it('두 번 승인하지 않는다', async () => {
@@ -585,6 +657,93 @@ describeWithDb('관리자 운영·시스템 라우트', () => {
           'UPDATE ads.production_gate SET activated = true, activated_at = now() WHERE id = true'
         )
       ).rejects.toThrow(/activation_follows_approval/);
+    });
+  });
+
+  // ── 광고 상품(등급)별 실운영 상태 ────────────────────────────
+
+  /**
+   * **검색 화면이 실제로 보는 스위치가 이것이다**(`routes/vendors.ts`가
+   * `ads.tier_state`를 `state = 'live'`로 건다). 전체 관문과 다른 자리라 따로 본다.
+   */
+  describe('광고 상품별 실운영 상태', () => {
+    const tiersOf = (body: unknown) => (body as { tiers: { tier: string; state: string }[] }).tiers;
+    const stateOf = (body: unknown, tier: string) =>
+      tiersOf(body).find((t) => t.tier === tier)?.state;
+
+    it('아무것도 안 정하면 전부 테스트다', async () => {
+      const operator = await operatorHeaders();
+
+      const response = await get('/v1/admin/ad-tiers', operator.headers);
+      expect(response.statusCode).toBe(200);
+
+      const tiers = tiersOf(response.json());
+      expect(tiers.length).toBeGreaterThan(0);
+      expect(tiers.every((t) => t.state === 'test')).toBe(true);
+    });
+
+    it('실운영으로 열고 테스트로 되돌린다', async () => {
+      const operator = await operatorHeaders();
+
+      const opened = await put('/v1/admin/ad-tiers/standard', operator.headers, { state: 'live' });
+      expect(opened.statusCode).toBe(200);
+      expect(stateOf(opened.json(), 'standard')).toBe('live');
+      /* 한 등급을 연다고 다른 등급이 따라 열리지 않는다. */
+      expect(stateOf(opened.json(), 'light')).toBe('test');
+
+      const back = await test.app.inject({
+        method: 'DELETE',
+        url: '/v1/admin/ad-tiers/standard',
+        headers: operator.headers,
+      });
+      expect(back.statusCode).toBe(200);
+      expect(stateOf(back.json(), 'standard')).toBe('test');
+    });
+
+    it('사람 없이 실운영이 되지 않는다 — 정한 사람이 남는다', async () => {
+      const operator = await operatorHeaders();
+      await put('/v1/admin/ad-tiers/light', operator.headers, { state: 'live' });
+
+      const { rows } = await test.pool.query<{ decided_by: string | null }>(
+        "SELECT decided_by FROM ads.launch_decisions WHERE tier = 'light'"
+      );
+      expect(rows[0]?.decided_by).toBe(operator.userId);
+    });
+
+    /*
+     * test는 시작 상태이지 결정이 아니다. 표의 `decision_is_not_test`가 막고 있고,
+     * 라우트 스키마도 받지 않는다 — 두 겹을 각각 확인한다.
+     */
+    it('test를 결정으로 적지 않는다 — 라우트가 막는다', async () => {
+      const operator = await operatorHeaders();
+
+      const response = await put('/v1/admin/ad-tiers/light', operator.headers, { state: 'test' });
+      expect(response.statusCode).toBe(400);
+    });
+
+    it('test를 결정으로 적지 않는다 — 스키마가 막는다', async () => {
+      const person = await test.pool.query<{ id: string }>(
+        'INSERT INTO structured.users DEFAULT VALUES RETURNING id'
+      );
+
+      await expect(
+        test.pool.query(
+          `INSERT INTO ads.launch_decisions (tier, state, decided_by)
+           VALUES ('light', 'test', $1::uuid)`,
+          [person.rows[0]!.id]
+        )
+      ).rejects.toThrow(/decision_is_not_test/);
+    });
+
+    it('이미 테스트인 것을 또 되돌리지 않는다', async () => {
+      const operator = await operatorHeaders();
+
+      const response = await test.app.inject({
+        method: 'DELETE',
+        url: '/v1/admin/ad-tiers/premium',
+        headers: operator.headers,
+      });
+      expect(response.statusCode).toBe(400);
     });
   });
 

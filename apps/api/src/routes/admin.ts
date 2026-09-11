@@ -1323,6 +1323,67 @@ export function registerAdminRoutes(app: FastifyInstance, context: AppContext): 
     return run(() => adminOps.approveAdsGate(context.pool, currentUserId(request), body.reason));
   });
 
+  /*
+   * 실운영 전환을 켜고 끈다 — 2026-09-11 대표 지시(「광고도 진행해. 단, 관리자에서
+   * 내가 컨트롤할 수 있어야 한다」).
+   *
+   * **입구가 여기 하나뿐이다.** 관리자 로그인을 지난 사람만 부를 수 있고
+   * (`auth`), 표의 `decided_by`·`activation_follows_approval`이 그 뒤를 받친다.
+   * 자동화·배치·스케줄러가 이 경로를 부르는 자리를 만들지 않는다.
+   */
+  app.post<{ Body: unknown }>('/v1/admin/ads-gate/activate', auth, async (request) => {
+    const body = reasonBody.parse(request.body ?? {});
+    return run(() => adminOps.activateAdsGate(context.pool, currentUserId(request), body.reason));
+  });
+
+  app.post<{ Body: unknown }>('/v1/admin/ads-gate/deactivate', auth, async (request) => {
+    const body = reasonBody.parse(request.body ?? {});
+    return run(() => adminOps.deactivateAdsGate(context.pool, currentUserId(request), body.reason));
+  });
+
+  // ─── 광고 상품(등급)별 실운영 상태 ────────────────────────────────────────
+  /*
+   * 검색 화면이 실제로 보는 스위치다. 전체 관문이 열려 있어도 등급이 test면 그
+   * 등급의 광고는 안 나간다(`ads.tier_state`).
+   */
+  app.get('/v1/admin/ad-tiers', auth, async () => ({
+    tiers: await adminOps.adTierStates(context.pool),
+  }));
+
+  const adTierBody = z.object({
+    /** test는 받지 않는다 — 시작 상태이지 결정이 아니다. 되돌리려면 DELETE. */
+    state: z.enum(['live', 'withheld', 'retired']),
+    note: z.string().trim().min(1).optional(),
+  });
+
+  app.put<{ Params: { tier: string }; Body: unknown }>(
+    '/v1/admin/ad-tiers/:tier',
+    auth,
+    async (request) => {
+      const body = adTierBody.parse(request.body ?? {});
+
+      return {
+        tiers: await run(() =>
+          adminOps.decideAdTier(
+            context.pool,
+            { tier: request.params.tier, state: body.state, note: body.note },
+            currentUserId(request)
+          )
+        ),
+      };
+    }
+  );
+
+  app.delete<{ Params: { tier: string } }>(
+    '/v1/admin/ad-tiers/:tier',
+    auth,
+    async (request) => ({
+      tiers: await run(() =>
+        adminOps.clearAdTierDecision(context.pool, request.params.tier, currentUserId(request))
+      ),
+    })
+  );
+
   // ─── AI Usage ─────────────────────────────────────────────────────────────
   app.get('/v1/admin/ai-usage', auth, async (request) => {
     const q = request.query as Record<string, string | undefined>;

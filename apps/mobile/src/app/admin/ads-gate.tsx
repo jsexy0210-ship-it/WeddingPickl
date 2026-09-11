@@ -27,8 +27,51 @@ type AdsGateData = {
   currentPhase: number;
   steps: GateStep[];
   readyForProduction: boolean;
+  /** 지금 광고가 나가는가. */
+  activated: boolean;
+  /** 승인은 끝났는데 아직 안 켠 상태. */
+  canActivate: boolean;
   blockers: string[];
 };
+
+/**
+ * 광고 상품(등급)별 상태. **검색 화면이 실제로 보는 스위치가 이것이다** —
+ * 전체 관문이 열려 있어도 등급이 «테스트»면 그 등급의 광고는 안 나간다.
+ */
+type TierState = 'test' | 'live' | 'withheld' | 'retired';
+type AdTier = {
+  tier: string;
+  state: TierState;
+  decidedAt: string | null;
+  placements: number;
+};
+
+const TIER_LABEL: Record<string, string> = {
+  light: '라이트',
+  standard: '스탠다드',
+  premium: '프리미엄',
+};
+
+const TIER_STATE_LABEL: Record<TierState, string> = {
+  test: '테스트 — 화면에 안 나감',
+  live: '실운영 — 화면에 나감',
+  withheld: '보류 — 화면에 안 나감',
+  retired: '종료 — 화면에 안 나감',
+};
+
+const TIER_STATE_COLOR: Record<TierState, string> = {
+  test: Colors.light.textAssistive,
+  live: Colors.light.positive,
+  withheld: Colors.light.cautionary,
+  retired: Colors.light.textAssistive,
+};
+
+/** 확인창이 하나라 무엇을 묻는 중인지 들고 있어야 한다. */
+type Asking =
+  | { kind: 'approve' }
+  | { kind: 'activate' }
+  | { kind: 'deactivate' }
+  | { kind: 'tier'; tier: string; state: TierState };
 
 const STEP_COLOR: Record<GateStepStatus, string> = {
   done: Colors.light.positive,
@@ -50,17 +93,23 @@ export default function AdsGateScreen() {
   const [rev, setRev] = useState(0);
   const [confirming, setConfirming] = useState(false);
   /** 확인창을 띄운 상태. 누르는 것과 확정하는 것을 나눈다(v3.27). */
-  const [asking, setAsking] = useState(false);
+  const [asking, setAsking] = useState<Asking | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [tiers, setTiers] = useState<AdTier[] | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true);
-    apiFetch('/v1/admin/ads-gate')
-      .then((d) => {
+    /*
+     * 관문과 등급을 함께 읽는다. 둘이 다른 스위치라 하나만 보면 «승인은 됐는데
+     * 왜 광고가 안 나가지»가 된다 — 등급이 테스트면 관문과 무관하게 안 나간다.
+     */
+    Promise.all([apiFetch('/v1/admin/ads-gate'), apiFetch('/v1/admin/ad-tiers')])
+      .then(([gate, tierList]) => {
         if (cancelled) return;
-        setData(d as AdsGateData);
+        setData(gate as AdsGateData);
+        setTiers((tierList as { tiers: AdTier[] }).tiers);
         setError(null);
         setLoading(false);
       })
@@ -72,10 +121,27 @@ export default function AdsGateScreen() {
     return () => { cancelled = true; };
   }, [rev]);
 
-  async function approveProduction() {
+  /**
+   * 확인창에서 «예»를 받은 뒤 실제로 부르는 자리. 무엇을 묻고 있었는지에 따라
+   * 주소가 갈린다.
+   *
+   * **되돌리는 길을 함께 둔다.** 켜기만 있고 끄기가 없으면 그것은 컨트롤이
+   * 아니다 — 되돌릴 수 없는 단추는 누르기 전에 망설이게 만든다.
+   */
+  async function confirmAsked(what: Asking) {
     setConfirming(true);
     try {
-      await apiFetch('/v1/admin/ads-gate/approve', { method: 'POST' });
+      if (what.kind === 'tier') {
+        await (what.state === 'test'
+          ? apiFetch(`/v1/admin/ad-tiers/${what.tier}`, { method: 'DELETE' })
+          : apiFetch(`/v1/admin/ad-tiers/${what.tier}`, {
+              method: 'PUT',
+              body: JSON.stringify({ state: what.state }),
+            }));
+      } else {
+        await apiFetch(`/v1/admin/ads-gate/${what.kind}`, { method: 'POST' });
+      }
+
       setActionError(null);
       setRev((r) => r + 1);
     } catch (e: unknown) {
@@ -84,7 +150,7 @@ export default function AdsGateScreen() {
     } finally {
       setConfirming(false);
       // 실패해도 닫는다 — 창이 떠 있으면 오류 문구가 창에 가린다.
-      setAsking(false);
+      setAsking(null);
     }
   }
 
@@ -110,9 +176,19 @@ export default function AdsGateScreen() {
       {!loading && !error && data && (
         <ScrollView style={styles.body} contentContainerStyle={styles.bodyContent}>
           {/* 현재 상태 */}
-          <View style={[styles.statusBanner, data.readyForProduction ? styles.bannerGreen : styles.bannerBlue]}>
+          {/*
+            **지금 봐야 할 것이 맨 위다**(v3.27). 이 화면에서 그것은 단계 번호가
+            아니라 «광고가 지금 나가는가»다 — 그것 하나 때문에 여기 들어온다.
+          */}
+          <View style={[styles.statusBanner, data.activated ? styles.bannerGreen : styles.bannerBlue]}>
             <Text style={styles.bannerTitle}>
-              {data.readyForProduction ? '실운영 전환 준비 완료' : `단계 ${data.currentPhase} 진행 중`}
+              {data.activated
+                ? '광고가 나가는 중이에요'
+                : data.canActivate
+                  ? '아직 안 나가요 — 켜면 나갑니다'
+                  : data.readyForProduction
+                    ? '실운영 전환 준비 완료'
+                    : `아직 안 나가요 · 단계 ${data.currentPhase} 진행 중`}
             </Text>
             {data.blockers.length > 0 && (
               <Text style={styles.bannerSub}>차단 요인: {data.blockers.join(', ')}</Text>
@@ -154,7 +230,7 @@ export default function AdsGateScreen() {
               </Text>
               <Pressable
                 style={[styles.approvalBtn, confirming && styles.btnDisabled]}
-                onPress={() => { setActionError(null); setAsking(true); }}
+                onPress={() => { setActionError(null); setAsking({ kind: 'approve' }); }}
                 disabled={confirming}
               >
                 <Text style={styles.approvalBtnText}>
@@ -164,31 +240,182 @@ export default function AdsGateScreen() {
               {actionError && <Text style={styles.actionError}>{actionError}</Text>}
             </View>
           )}
+
+          {/*
+            실운영 스위치.
+
+            승인과 전환은 다른 일이라 단추도 따로 둔다 — 승인은 «열기로 정했다»는
+            기록이고, 이것은 «지금 나간다»는 상태다.
+          */}
+          {(data.canActivate || data.activated) && (
+            <View style={styles.approvalBox}>
+              <Text style={styles.approvalTitle}>
+                {data.activated ? '광고가 나가는 중이에요' : '켜면 광고가 나가요'}
+              </Text>
+              <Text style={styles.approvalDesc}>
+                {data.activated
+                  ? '끄면 곧바로 멈춰요. 승인 기록은 지워지지 않아요.'
+                  : '승인은 끝났어요. 이 단추를 눌러야 실제로 나갑니다.'}
+              </Text>
+              <Pressable
+                style={[
+                  data.activated ? styles.stopBtn : styles.approvalBtn,
+                  confirming && styles.btnDisabled,
+                ]}
+                onPress={() => {
+                  setActionError(null);
+                  setAsking({ kind: data.activated ? 'deactivate' : 'activate' });
+                }}
+                disabled={confirming}
+              >
+                <Text style={styles.approvalBtnText}>
+                  {confirming ? '처리 중…' : data.activated ? '광고 끄기' : '광고 켜기'}
+                </Text>
+              </Pressable>
+              {actionError && <Text style={styles.actionError}>{actionError}</Text>}
+            </View>
+          )}
+
+          {/*
+            상품별 상태.
+
+            **여기가 검색 화면이 실제로 보는 스위치다.** 위의 관문이 열려 있어도
+            등급이 «테스트»면 그 등급의 광고는 한 장도 안 나간다. 두 스위치를 한
+            화면에 두는 이유가 그것이다 — 따로 두면 «승인했는데 왜 안 나오지»가 된다.
+          */}
+          {tiers && tiers.length > 0 && (
+            <View style={styles.tierBox}>
+              <Text style={styles.tierBoxTitle}>상품별 상태</Text>
+              <Text style={styles.tierBoxDesc}>
+                검색 결과에 실제로 나가는지는 상품마다 따로 정해요.
+              </Text>
+              {tiers.map((tier) => (
+                <View key={tier.tier} style={styles.tierRow}>
+                  <View style={styles.tierMain}>
+                    <Text style={styles.tierName}>{TIER_LABEL[tier.tier] ?? tier.tier}</Text>
+                    <Text style={[styles.tierState, { color: TIER_STATE_COLOR[tier.state] }]}>
+                      {TIER_STATE_LABEL[tier.state]}
+                    </Text>
+                    <Text style={styles.tierMeta}>
+                      {tier.placements > 0 ? `오늘 자리 ${tier.placements}건` : '오늘 자리 없음'}
+                      {tier.decidedAt ? ` · 정한 날 ${formatDateDot(tier.decidedAt)}` : ''}
+                    </Text>
+                  </View>
+                  <View style={styles.tierActions}>
+                    {(['live', 'withheld', 'test'] as const).map((next) => (
+                      <Pressable
+                        key={next}
+                        style={[
+                          styles.tierBtn,
+                          tier.state === next && styles.tierBtnOn,
+                          confirming && styles.btnDisabled,
+                        ]}
+                        disabled={confirming || tier.state === next}
+                        onPress={() => {
+                          setActionError(null);
+                          setAsking({ kind: 'tier', tier: tier.tier, state: next });
+                        }}
+                      >
+                        <Text
+                          style={[styles.tierBtnText, tier.state === next && styles.tierBtnTextOn]}
+                        >
+                          {next === 'live' ? '실운영' : next === 'withheld' ? '보류' : '테스트'}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </View>
+              ))}
+            </View>
+          )}
         </ScrollView>
       )}
 
       {/*
-        **승인은 전환이 아니다.** 확인창이 그 사실을 먼저 말한다 — 이 단추를
-        누르면 실제로 광고가 켜진다고 읽히면 안 된다(대표 오더 대기).
+        **위험한 조작은 무엇이 바뀌는지 항목으로 보여준 뒤 한 번 더 확인한다**(v3.27).
+        묻는 것이 넷이라 문구도 넷이다 — 「승인」과 「켜기」를 같은 말로 물으면
+        누르는 사람이 둘을 같은 일로 읽는다.
       */}
-      {/*
-        **승인은 전환이 아니다.** 확인 항목이 그 사실을 먼저 말한다 — 이 단추를
-        누르면 광고가 켜진다고 읽히면 안 된다(대표 오더 대기).
-      */}
-      {asking ? (
+      {asking?.kind === 'approve' ? (
         <ConfirmCard
           title="실운영 전환을 승인할까요?"
           body="승인은 기록으로 남고, 광고가 지금 켜지지는 않아요."
           items={[
             '실운영 전환 승인이 기록돼요',
-            '광고는 켜지지 않아요 — 실제 전환은 대표 오더를 기다립니다',
+            '광고는 아직 안 나가요 — 켜는 것은 따로 눌러야 해요',
             '승인한 사람과 시각이 감사 기록에 남아요',
             '승인은 한 번만 할 수 있어요',
           ]}
           cta="승인"
           danger
-          onConfirm={() => void approveProduction()}
-          onCancel={() => setAsking(false)}
+          onConfirm={() => void confirmAsked({ kind: 'approve' })}
+          onCancel={() => setAsking(null)}
+        />
+      ) : null}
+
+      {asking?.kind === 'activate' ? (
+        <ConfirmCard
+          title="광고를 켤까요?"
+          body="누르면 실운영으로 연 상품의 광고가 검색 결과에 나갑니다."
+          items={[
+            '실운영으로 연 상품의 광고가 사용자에게 보여요',
+            '테스트·보류 상품은 그대로 안 나가요',
+            '켠 사람과 시각이 감사 기록에 남아요',
+            '언제든 다시 끌 수 있어요',
+          ]}
+          cta="켜기"
+          danger
+          onConfirm={() => void confirmAsked({ kind: 'activate' })}
+          onCancel={() => setAsking(null)}
+        />
+      ) : null}
+
+      {asking?.kind === 'deactivate' ? (
+        <ConfirmCard
+          title="광고를 끌까요?"
+          body="누르면 검색 결과에서 광고가 곧바로 내려갑니다."
+          items={[
+            '모든 광고가 사용자 화면에서 내려가요',
+            '팔린 광고 자리는 지워지지 않아요 — 노출만 멈춰요',
+            '승인 기록은 남아요',
+            '끈 사람과 시각이 감사 기록에 남아요',
+          ]}
+          cta="끄기"
+          danger
+          onConfirm={() => void confirmAsked({ kind: 'deactivate' })}
+          onCancel={() => setAsking(null)}
+        />
+      ) : null}
+
+      {asking?.kind === 'tier' ? (
+        <ConfirmCard
+          title={`${TIER_LABEL[asking.tier] ?? asking.tier} 상품을 ${
+            asking.state === 'live' ? '실운영으로 열까요?' : asking.state === 'withheld' ? '보류할까요?' : '테스트로 되돌릴까요?'
+          }`}
+          body={
+            asking.state === 'live'
+              ? '이 상품의 광고가 검색 결과에 나갈 수 있게 됩니다.'
+              : '이 상품의 광고가 검색 결과에서 내려갑니다.'
+          }
+          items={
+            asking.state === 'live'
+              ? [
+                  '이 상품의 광고가 검색 결과에 나가요',
+                  '광고 전체 스위치가 꺼져 있으면 그래도 안 나가요',
+                  '정한 사람과 시각이 감사 기록에 남아요',
+                  '언제든 보류하거나 테스트로 되돌릴 수 있어요',
+                ]
+              : [
+                  '이 상품의 광고가 화면에서 내려가요',
+                  '팔린 광고 자리는 지워지지 않아요 — 노출만 멈춰요',
+                  '정한 사람과 시각이 감사 기록에 남아요',
+                  '다시 실운영으로 열 수 있어요',
+                ]
+          }
+          cta={asking.state === 'live' ? '실운영으로' : asking.state === 'withheld' ? '보류' : '테스트로'}
+          danger
+          onConfirm={() => void confirmAsked(asking)}
+          onCancel={() => setAsking(null)}
         />
       ) : null}
 
@@ -276,5 +503,44 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   approvalBtnText: { fontSize: FontSize.t6, fontWeight: '700', color: Colors.light.background },
+  /** 끄는 단추. 켜는 것과 같은 색이면 무엇을 누르는지 손이 먼저 헷갈린다. */
+  stopBtn: {
+    backgroundColor: Colors.light.negative,
+    borderRadius: 6,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+
+  // ── 상품별 상태 ───────────────────────────────────────────────
+  tierBox: {
+    backgroundColor: Colors.light.background,
+    borderRadius: 10,
+    padding: Spacing.three,
+    gap: Spacing.two,
+  },
+  tierBoxTitle: { fontSize: FontSize.t5, fontWeight: '700', color: Colors.light.text },
+  tierBoxDesc: { fontSize: FontSize.t7, color: Colors.light.textAssistive },
+  tierRow: {
+    borderTopWidth: 1,
+    borderTopColor: Colors.light.border,
+    paddingTop: Spacing.two,
+    gap: Spacing.two,
+  },
+  tierMain: { gap: 2 },
+  tierName: { fontSize: FontSize.t6, fontWeight: '700', color: Colors.light.text },
+  tierState: { fontSize: FontSize.t7, fontWeight: '700' },
+  tierMeta: { fontSize: FontSize.t7, color: Colors.light.textAssistive },
+  tierActions: { flexDirection: 'row', gap: Spacing.one },
+  tierBtn: {
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+    backgroundColor: Colors.light.background,
+    borderRadius: 999,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+  },
+  tierBtnOn: { backgroundColor: Colors.light.text, borderColor: Colors.light.text },
+  tierBtnText: { fontSize: FontSize.t7, fontWeight: '700', color: Colors.light.textSecondary },
+  tierBtnTextOn: { color: Colors.light.background },
   btnDisabled: { opacity: 0.5 },
 });

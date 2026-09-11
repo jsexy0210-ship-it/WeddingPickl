@@ -1142,7 +1142,12 @@ export type GateStep = {
 export type AdsGateData = {
   currentPhase: number;
   steps: GateStep[];
+  /** 승인 단추를 그릴지. 승인이 아직 안 됐고 보고서가 다 있을 때만 참이다. */
   readyForProduction: boolean;
+  /** 지금 광고가 나가는 상태인가. */
+  activated: boolean;
+  /** 켜기 단추를 그릴지. 승인은 끝났는데 아직 안 켠 상태다. */
+  canActivate: boolean;
   blockers: string[];
 };
 
@@ -1234,27 +1239,41 @@ export async function adsGate(db: Queryable): Promise<AdsGateData> {
     {
       id: 'production',
       label: '실운영 오픈',
-      description: '승인과 별개로 대표 오더를 기다립니다',
+      description: '승인과 별개로 한 번 더 켜야 광고가 나갑니다',
       /*
-       * **승인해도 여기는 열리지 않는다.** 광고 실운영 전환은 사용자 오더 대기
-       * 상태이고(`CLAUDE.md` 「진행 상태」), 이 판에는 `activated`를 켜는 길이 없다.
+       * **승인해도 여기는 저절로 열리지 않는다.** 승인과 전환은 다른 일이고,
+       * 켜는 것은 사람이 따로 누른다(`activateAdsGate`).
+       *
+       * 2026-09-11 대표 지시로 켜는 길이 생겼다(그 전에는 길 자체가 없어
+       * `blocked`였다). 이제 승인이 끝났으면 «켤 수 있음»이다.
        */
-      status: activated ? 'done' : 'blocked',
+      status: activated ? 'done' : approvedAt ? 'in_progress' : 'pending',
       completedAt: iso(gate[0]?.activated_at ?? null),
-      detail: activated ? null : '대표 오더 대기',
-      requiresAction: false,
+      detail: activated
+        ? null
+        : approvedAt
+          ? '켜면 광고가 나갑니다'
+          : '승인 먼저예요',
+      requiresAction: Boolean(approvedAt) && !activated,
     },
   ];
 
+  /*
+   * **막고 있는 것만 적는다.** 「켜면 나갑니다」는 안내이지 차단이 아닌데 여기
+   * 넣었더니 화면이 「차단 요인: 켜면 광고가 나갑니다」로 읽혔다(2026-09-11 캡처).
+   * 켤 수 있다는 사실은 `canActivate`와 그 카드가 따로 말한다.
+   */
   const blockers: string[] = [];
   if (!bothAnalyzed) blockers.push('독립 분석 보고서 2건이 필요해요');
-  if (approvedAt) blockers.push('승인은 끝났어요. 실운영 전환은 대표 오더를 기다립니다');
 
   return {
     currentPhase: steps.filter((s) => s.status === 'done').length,
     steps,
     /** 승인이 남았을 때만 단추를 그린다. 이미 승인됐으면 다시 누를 자리가 없다. */
     readyForProduction: bothAnalyzed && !approvedAt,
+    /** 켜짐 여부와 켤 수 있는지. 화면이 단추를 어느 쪽으로 그릴지 정한다. */
+    activated,
+    canActivate: Boolean(approvedAt) && !activated,
     blockers,
   };
 }
@@ -1311,6 +1330,232 @@ export async function approveAdsGate(
     });
 
     return { activated: false };
+  });
+}
+
+/**
+ * 실운영 전환을 **켠다**.
+ *
+ * 2026-09-11 대표 지시 — 「광고도 진행해. 단, 관리자에서 내가 컨트롤할 수 있어야
+ * 한다」. 그 전까지 `activated`를 켜는 길이 코드에 없었고(승인까지만 있었다),
+ * 그래서 광고 자리를 아무리 만들어도 화면에는 한 장도 나가지 않았다.
+ *
+ * **이 함수를 사람만 부른다.** 관리자 화면의 단추가 유일한 입구이고, 자동화·
+ * 배치·스케줄러가 이것을 부르는 자리를 만들지 않는다 — 「AI가 멋대로 광고
+ * 스위치를 올리는 일 금지」가 표의 `decided_by`와 여기까지 와야 뜻이 있다.
+ *
+ * 승인 없이는 켜지지 않는다. 표의 `activation_follows_approval`이 막고 있어
+ * 여기서 한 번 더 보는 것은 **사람에게 이유를 말해 주기 위해서**다 — 제약이
+ * 던지는 오류는 왜 막혔는지 알려주지 않는다.
+ */
+export async function activateAdsGate(
+  pool: Pool,
+  by: string,
+  reason: string | undefined
+): Promise<{ activated: true; activatedAt: string }> {
+  return withTransaction(pool, async (client) => {
+    const { rows } = await client.query<{ approved_at: Date | null; activated: boolean }>(
+      'SELECT approved_at, activated FROM ads.production_gate WHERE id = true FOR UPDATE'
+    );
+
+    const found = rows[0];
+    if (!found) throw notFound('실운영 관문');
+
+    if (!found.approved_at) {
+      throw new ApiError('invalid_request', '먼저 승인해야 켤 수 있습니다.');
+    }
+
+    if (found.activated) {
+      throw new ApiError('invalid_request', '이미 켜져 있습니다.');
+    }
+
+    const { rows: updated } = await client.query<{ activated_at: Date }>(
+      `UPDATE ads.production_gate
+       SET activated = true, activated_at = now()
+       WHERE id = true
+       RETURNING activated_at`
+    );
+
+    await recordDecision(client, {
+      eventId: newEventId(),
+      workflow: 'ads_production_gate',
+      step: 'activate',
+      subjectKind: 'ads_production_gate',
+      subjectId: null,
+      decider: { kind: 'human', userId: by },
+      /* 사람이 적은 사유가 여기 남는다 — 이 표의 관례다(위 recordDecision 호출들과 같다). */
+      decision: reasonOf(reason),
+      reasonCode: 'ads_gate_activated',
+      evidence: [],
+    });
+
+    return { activated: true, activatedAt: updated[0]!.activated_at.toISOString() };
+  });
+}
+
+/**
+ * 실운영 전환을 **끈다**.
+ *
+ * 켜는 길만 만들면 그것은 컨트롤이 아니다. 되돌릴 수 없는 단추를 관리자에 두면
+ * 누르기 전에 망설이게 되고, 망설이면 확인해야 할 것을 확인하지 못한다.
+ *
+ * **승인은 지우지 않는다.** 껐다 켜는 것과 승인을 무르는 것은 다른 일이고, 승인
+ * 기록은 누가 언제 왜 열기로 했는지를 남기는 자리다 — 끌 때마다 지우면 그 기록이
+ * 사라진다.
+ */
+export async function deactivateAdsGate(
+  pool: Pool,
+  by: string,
+  reason: string | undefined
+): Promise<{ activated: false }> {
+  return withTransaction(pool, async (client) => {
+    const { rows } = await client.query<{ activated: boolean }>(
+      'SELECT activated FROM ads.production_gate WHERE id = true FOR UPDATE'
+    );
+
+    const found = rows[0];
+    if (!found) throw notFound('실운영 관문');
+
+    if (!found.activated) {
+      throw new ApiError('invalid_request', '이미 꺼져 있습니다.');
+    }
+
+    await client.query(
+      'UPDATE ads.production_gate SET activated = false, activated_at = NULL WHERE id = true'
+    );
+
+    await recordDecision(client, {
+      eventId: newEventId(),
+      workflow: 'ads_production_gate',
+      step: 'deactivate',
+      subjectKind: 'ads_production_gate',
+      subjectId: null,
+      decider: { kind: 'human', userId: by },
+      decision: reasonOf(reason),
+      reasonCode: 'ads_gate_deactivated',
+      evidence: [],
+    });
+
+    return { activated: false };
+  });
+}
+
+/**
+ * 광고 상품(등급)별 현재 상태.
+ *
+ * **검색 화면이 실제로 보는 스위치가 이것이다**(`apps/api/src/routes/vendors.ts`가
+ * `ads.tier_state`를 `state = 'live'`로 건다). 전체 관문(`production_gate`)과 다른
+ * 자리다 — 관문이 열려 있어도 등급이 `test`면 그 등급의 광고는 안 나간다.
+ *
+ * 결정이 없는 등급은 `test`다(뷰 `ads.tier_state`). 아무것도 안 정한 상품이
+ * 실운영으로 시작하지 않는다.
+ */
+export type AdTierState = {
+  tier: string;
+  state: 'test' | 'live' | 'withheld' | 'retired';
+  decidedAt: string | null;
+  /** 자리가 몇 개 팔렸는지. 끄기 전에 무엇이 내려가는지 보여준다. */
+  placements: number;
+};
+
+export async function adTierStates(db: Queryable): Promise<AdTierState[]> {
+  const { rows } = await db.query<{
+    tier: string;
+    state: AdTierState['state'];
+    decided_at: Date | null;
+    placements: string;
+  }>(
+    `SELECT t.tier, t.state, t.decided_at,
+            (SELECT count(*) FROM ads.active_placements p WHERE p.tier = t.tier) AS placements
+     FROM ads.tier_state t
+     ORDER BY t.tier`
+  );
+
+  return rows.map((row) => ({
+    tier: row.tier,
+    state: row.state,
+    decidedAt: row.decided_at?.toISOString() ?? null,
+    placements: Number(row.placements),
+  }));
+}
+
+/**
+ * 등급 하나의 실운영 상태를 정한다.
+ *
+ * `test`는 받지 않는다 — 표의 `decision_is_not_test`가 막는다. 시작 상태이지
+ * 결정이 아니기 때문이고, 되돌리려면 결정을 **지운다**(`clearAdTierDecision`).
+ *
+ * `decided_by`가 NOT NULL이라 **사람 없이 실운영이 될 수 없다**(0043). 그 칸을
+ * 채우는 값은 지금 로그인한 관리자이고, 자동화가 부를 자리를 만들지 않는다.
+ */
+export async function decideAdTier(
+  pool: Pool,
+  input: { tier: string; state: 'live' | 'withheld' | 'retired'; note?: string },
+  by: string
+): Promise<AdTierState[]> {
+  return withTransaction(pool, async (client) => {
+    const { rowCount } = await client.query(
+      `INSERT INTO ads.launch_decisions (tier, state, decided_by, note)
+       VALUES ($1::ad_tier, $2::ad_launch_state, $3::uuid, $4)
+       ON CONFLICT (tier) DO UPDATE
+         SET state = EXCLUDED.state,
+             decided_at = now(),
+             decided_by = EXCLUDED.decided_by,
+             note = EXCLUDED.note`,
+      [input.tier, input.state, by, input.note?.trim() || null]
+    );
+
+    if (!rowCount) throw notFound('광고 상품');
+
+    await recordDecision(client, {
+      eventId: newEventId(),
+      workflow: 'ads_launch',
+      step: 'decide',
+      subjectKind: 'ad_tier',
+      subjectId: null,
+      decider: { kind: 'human', userId: by },
+      decision: reasonOf(input.note),
+      reasonCode: `ad_tier_${input.state}`,
+      evidence: [],
+    });
+
+    return adTierStates(client);
+  });
+}
+
+/**
+ * 등급의 결정을 지워 테스트로 되돌린다.
+ *
+ * 끄는 길이 없으면 컨트롤이 아니다. `state`에 `test`를 적을 수 없으므로
+ * (표의 `decision_is_not_test`) 되돌리는 방법은 결정을 지우는 것뿐이다 —
+ * 뷰가 결정 없는 등급을 `test`로 계산한다.
+ */
+export async function clearAdTierDecision(
+  pool: Pool,
+  tier: string,
+  by: string
+): Promise<AdTierState[]> {
+  return withTransaction(pool, async (client) => {
+    const { rowCount } = await client.query(
+      'DELETE FROM ads.launch_decisions WHERE tier = $1::ad_tier',
+      [tier]
+    );
+
+    if (!rowCount) throw new ApiError('invalid_request', '이미 테스트 상태입니다.');
+
+    await recordDecision(client, {
+      eventId: newEventId(),
+      workflow: 'ads_launch',
+      step: 'clear',
+      subjectKind: 'ad_tier',
+      subjectId: null,
+      decider: { kind: 'human', userId: by },
+      decision: CONSOLE_REASON,
+      reasonCode: 'ad_tier_test',
+      evidence: [],
+    });
+
+    return adTierStates(client);
   });
 }
 
